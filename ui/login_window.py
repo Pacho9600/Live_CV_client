@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import webbrowser
+
 from PyQt5 import QtCore, QtWidgets
 
 from config import API_BASE_URL
@@ -13,6 +15,9 @@ class LoginWindow(QtWidgets.QMainWindow):
     def __init__(self, api: ApiClient):
         super().__init__()
         self.api = api
+        self._flow: DesktopBrowserLogin | None = None
+        self._attempt_counter = 0
+        self._current_attempt_id = 0
         self.setWindowTitle("Architecture Showcase — Desktop Login")
         self.setMinimumSize(560, 320)
 
@@ -41,12 +46,19 @@ class LoginWindow(QtWidgets.QMainWindow):
         self.login_btn = QtWidgets.QPushButton("Login in Browser")
         self.login_btn.clicked.connect(self._start_login)
 
-        self.example_btn = QtWidgets.QPushButton("Example")
-        self.example_btn.setToolTip("Opens the browser and pre-fills demo credentials on the login page.")
-        self.example_btn.clicked.connect(lambda: self._start_login(prefill=True))
+        self.register_btn = QtWidgets.QPushButton("Registration")
+        self.register_btn.setToolTip("Opens the registration flow in your browser.")
+        self.register_btn.clicked.connect(self._open_registration)
+
+        self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        self.cancel_btn.setToolTip("Cancels the current login attempt.")
+        self.cancel_btn.setDisabled(True)
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._cancel_login)
 
         btn_row.addWidget(self.login_btn)
-        btn_row.addWidget(self.example_btn)
+        btn_row.addWidget(self.register_btn)
+        btn_row.addWidget(self.cancel_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
@@ -59,26 +71,93 @@ class LoginWindow(QtWidgets.QMainWindow):
 
     def _set_busy(self, busy: bool) -> None:
         self.login_btn.setDisabled(busy)
-        self.example_btn.setDisabled(busy)
+        self.register_btn.setDisabled(busy)
+        self.cancel_btn.setVisible(busy)
+        self.cancel_btn.setDisabled(not busy)
         self.setCursor(QtCore.Qt.WaitCursor if busy else QtCore.Qt.ArrowCursor)
 
+    def _cancel_login(self) -> None:
+        self._current_attempt_id = 0
+        if self._flow:
+            self._flow.cancel()
+            self._flow = None
+        self.status.setStyleSheet("color: #B00020;")
+        self.status.setText("Login canceled.")
+        self._set_busy(False)
+
+    def _open_registration(self) -> None:
+        health = self.api.health()
+        if not health.ok:
+            self.status.setStyleSheet("color: #B00020;")
+            details = ""
+            if health.error:
+                details = f"\n{health.error}"
+                err = health.error.lower()
+                if "read timed out" in err or "timed out" in err:
+                    details += "\nTip: restart the server (stop any old uvicorn/python processes)."
+                elif "refused" in err:
+                    details += "\nTip: the server is not running (connection refused)."
+            self.status.setText(f"Server not reachable at {API_BASE_URL}. Start the server first.{details}")
+            return
+
+        url = f"{API_BASE_URL.rstrip('/')}/desktop/register"
+        webbrowser.open(url)
+        self.status.setStyleSheet("color: #333;")
+        self.status.setText("Opened registration in your browser.")
+
     def _start_login(self, prefill: bool = False) -> None:
+        health = self.api.health()
+        if not health.ok:
+            self.status.setStyleSheet("color: #B00020;")
+            details = ""
+            if health.error:
+                details = f"\n{health.error}"
+                err = health.error.lower()
+                if "read timed out" in err or "timed out" in err:
+                    details += "\nTip: restart the server (stop any old uvicorn/python processes)."
+                elif "refused" in err:
+                    details += "\nTip: the server is not running (connection refused)."
+            self.status.setText(f"Server not reachable at {API_BASE_URL}. Start the server first.{details}")
+            return
+
+        self._attempt_counter += 1
+        attempt_id = self._attempt_counter
+        self._current_attempt_id = attempt_id
+
         self._set_busy(True)
         self.status.setStyleSheet("color: #333;")
-        self.status.setText("Opening browser… complete login in the browser tab.")
+        self.status.setText("Opening browser... complete login in the browser tab (or click Cancel).")
 
         flow = DesktopBrowserLogin(API_BASE_URL)
+        self._flow = flow
         redirect_uri = flow.start_callback_server()
-        flow.open_browser(redirect_uri=redirect_uri, prefill=prefill)
+        opened = flow.open_browser(redirect_uri=redirect_uri, prefill=prefill)
+        if not opened:
+            self.status.setStyleSheet("color: #B00020;")
+            self.status.setText("Could not open a browser window. Please open the login URL manually.")
+            self._current_attempt_id = 0
+            self._flow = None
+            self._set_busy(False)
+            return
 
         # Wait in a background thread so UI stays responsive
-        worker = _WaitForCodeWorker(flow=flow)
+        worker = _WaitForCodeWorker(flow=flow, attempt_id=attempt_id)
         worker.finished.connect(self._on_code_received)
         worker.start()
         self._worker = worker  # keep alive
 
-    def _on_code_received(self, code: str, state: str, code_verifier: str, expected_state: str):
+    def _on_code_received(self, code: str, state: str, code_verifier: str, expected_state: str, reason: str, attempt_id: int):
+        if attempt_id != self._current_attempt_id:
+            return
         try:
+            if reason == "canceled":
+                self.status.setStyleSheet("color: #B00020;")
+                self.status.setText("Login canceled.")
+                return
+            if reason == "timeout" or not code or not state:
+                self.status.setStyleSheet("color: #B00020;")
+                self.status.setText("Login timed out (1 minute). Please complete login in the browser and try again.")
+                return
             if state != expected_state:
                 self.status.setStyleSheet("color: #B00020;")
                 self.status.setText("Login failed: state mismatch.")
@@ -101,20 +180,23 @@ class LoginWindow(QtWidgets.QMainWindow):
             self.status.setText("Login OK.")
             self.logged_in.emit(token)
         finally:
+            self._current_attempt_id = 0
+            self._flow = None
             self._set_busy(False)
 
 
 class _WaitForCodeWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(str, str, str, str)  # code, state, verifier, expected_state
+    finished = QtCore.pyqtSignal(str, str, str, str, str, int)  # code, state, verifier, expected_state, reason, attempt_id
 
-    def __init__(self, flow: DesktopBrowserLogin):
+    def __init__(self, flow: DesktopBrowserLogin, attempt_id: int):
         super().__init__()
         self.flow = flow
+        self.attempt_id = attempt_id
 
     def run(self):
-        code, state = self.flow.wait_for_code(timeout_s=120)
+        code, state = self.flow.wait_for_code(timeout_s=60)
         if not code or not state:
-            # emit empty -> UI will show error
-            self.finished.emit("", "", self.flow.code_verifier, self.flow.state)
+            reason = "canceled" if self.flow.was_canceled else "timeout"
+            self.finished.emit("", "", self.flow.code_verifier, self.flow.state, reason, self.attempt_id)
             return
-        self.finished.emit(code, state, self.flow.code_verifier, self.flow.state)
+        self.finished.emit(code, state, self.flow.code_verifier, self.flow.state, "ok", self.attempt_id)

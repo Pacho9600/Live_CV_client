@@ -41,6 +41,19 @@ class ApiClient:
         except Exception as e:
             return ApiResult(False, 0, error=str(e))
 
+    def health(self) -> ApiResult:
+        url = f"{self.base_url}/health"
+        try:
+            r = requests.get(url, headers=self._headers(), timeout=3)
+            if r.status_code == 200:
+                try:
+                    return ApiResult(True, 200, data=r.json())
+                except Exception:
+                    return ApiResult(True, 200, data={"raw": r.text})
+            return ApiResult(False, r.status_code, error=r.text)
+        except Exception as e:
+            return ApiResult(False, 0, error=str(e))
+
     def me(self) -> ApiResult:
         url = f"{self.base_url}/api/auth/me"
         try:
